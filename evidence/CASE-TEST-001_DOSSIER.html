@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>FORENSIC EVIDENCE DOSSIER | CASE-TEST-001</title>
+<style>
+  body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #0b0f19; color: #f3f4f6; margin: 0; padding: 40px; }
+  .dossier-box { max-width: 900px; margin: 0 auto; background: #111827; border: 1px solid #1f2937; border-radius: 8px; box-shadow: 0 10px 40px rgba(0,0,0,0.5); }
+  .header { background: #1e293b; padding: 24px 32px; border-bottom: 2px solid #ef4444; display: flex; justify-content: space-between; align-items: center; }
+  .title { font-size: 20px; font-weight: 800; letter-spacing: 0.5px; color: #f8fafc; }
+  .badge-danger { background: rgba(239, 68, 68, 0.2); color: #ef4444; border: 1px solid #ef4444; padding: 4px 12px; border-radius: 4px; font-weight: bold; font-size: 12px; }
+  .content { padding: 32px; }
+  .meta-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; background: #0f172a; padding: 20px; border-radius: 6px; border: 1px solid #1e293b; margin-bottom: 24px; }
+  .meta-item { font-size: 13px; }
+  .meta-label { color: #94a3b8; font-weight: 600; text-transform: uppercase; font-size: 11px; margin-bottom: 4px; }
+  .meta-val { color: #f1f5f9; font-family: 'Courier New', monospace; font-size: 14px; font-weight: bold; }
+  h3 { font-size: 14px; text-transform: uppercase; letter-spacing: 0.8px; color: #38bdf8; border-bottom: 1px solid #1e293b; padding-bottom: 8px; margin-top: 24px; margin-bottom: 12px; }
+  .hex-view { background: #020617; border: 1px solid #1e293b; padding: 16px; border-radius: 6px; font-family: 'Courier New', monospace; font-size: 12px; color: #4ade80; word-break: break-all; line-height: 1.6; }
+  .signature-block { margin-top: 36px; padding: 20px; border-top: 1px dashed #334155; display: flex; justify-content: space-between; font-size: 12px; color: #94a3b8; }
+  .btn-download { display: inline-block; background: #0284c7; color: white; text-decoration: none; padding: 8px 16px; border-radius: 4px; font-weight: bold; font-size: 12px; margin-top: 12px; }
+</style>
+</head>
+<body>
+<div class="dossier-box">
+  <div class="header">
+    <div>
+      <div class="title">DAIKIN INDUSTRIAL DFIR CASE DOSSIER</div>
+      <div style="font-size: 12px; color: #94a3b8; margin-top: 4px;">Incident Investigation & Attribution Certificate</div>
+    </div>
+    <span class="badge-danger">VERIFIED EVIDENCE RECORD</span>
+  </div>
+
+  <div class="content">
+    <div class="meta-grid">
+      <div class="meta-item">
+        <div class="meta-label">Case Identifier</div>
+        <div class="meta-val">CASE-TEST-001</div>
+      </div>
+      <div class="meta-item">
+        <div class="meta-label">Incident Timestamp</div>
+        <div class="meta-val">2026-11-09 11:45:00 UTC</div>
+      </div>
+      <div class="meta-item">
+        <div class="meta-label">Suspect IP Address</div>
+        <div class="meta-val" style="color: #ef4444;">192.168.10.45</div>
+      </div>
+      <div class="meta-item">
+        <div class="meta-label">Target Facility & Unit</div>
+        <div class="meta-val">DAIKIN-VRV-PARIS-04 (Châtelet Flagship Store)</div>
+      </div>
+      <div class="meta-item">
+        <div class="meta-label">Protocol Vector</div>
+        <div class="meta-val">BACnet/IP (Port 47808)</div>
+      </div>
+      <div class="meta-item">
+        <div class="meta-label">Tampered Parameter</div>
+        <div class="meta-val">Present_Value $\rightarrow$ <span style="color: #ef4444;">39.5&deg;C</span> (Baseline: 21.5&deg;C)</div>
+      </div>
+    </div>
+
+    <h3>1. Cryptographic Evidence Integrity (Chain of Custody)</h3>
+    <div style="font-size: 13px; line-height: 1.6; color: #cbd5e1; margin-bottom: 8px;">
+      Full packet capture recorded out-of-band by the PARIS-AC Active Deception Node. Evidence is sealed and tamper-verifiable via SHA-256 hash.
+    </div>
+    <div class="hex-view" style="color: #38bdf8;">
+      PCAP Artifact: CASE-TEST-001.pcap<br>
+      SHA-256 Hash: c956fbec3d3f24c0183e2529fccdf002bed3f08a5e146bd412f38fec5a9e396c
+    </div>
+
+    <h3>2. MITRE ATT&CK for Industrial Control Systems (ICS) Attribution</h3>
+    <ul style="font-size: 13px; color: #cbd5e1; line-height: 1.8; margin-left: 20px;">
+      <li><strong>T0836 - Modify Parameter:</strong> Unauthorized modification of commercial VRV chilled water / refrigerant loop setpoint.</li>
+      <li><strong>T0855 - Unauthorized Command Message:</strong> Injected rogue BACnet/IP WriteProperty packet into OT VLAN.</li>
+      <li><strong>T0887 - Wireless/Network Sniffing:</strong> Probed port 47808 (BACnet Who-Is request) to discover Daikin controller.</li>
+    </ul>
+
+    <h3>3. Forensic Raw Packet Hex Dump</h3>
+    <div class="hex-view">
+42 41 43 4e 45 54 5f 57 52 49 54 45 5f 50 52 4f 50 45 52 54 59 3a 20 61 6e 61 6c 6f 67 56 61 6c 75 65 3a 31 20 70 72 65 73 65 6e 74 56 61 6c 75 65 3d 33 39 2e 35 20 6f 76 65 72 72 69 64 65 3d 74 72 75 65
+    </div>
+
+    <h3>4. Automated Legal & Remediation Action</h3>
+    <div style="font-size: 13px; color: #cbd5e1; line-height: 1.6;">
+      - Firewall Rule Applied: <code>netsh advfirewall firewall add rule name="ISOLATE_BACNET_192.168.10.45" dir=in action=block remoteip=192.168.10.45</code><br>
+      - Physical Failsafe: Daikin VRV controller command quarantined. Emergency thermal interlock active.
+    </div>
+
+    <div class="signature-block">
+      <div>Certified by: <strong>PARIS-AC Deception Engine v2.0</strong></div>
+      <div>Security Division: <strong>Daikin Cybersecurity Incident Response Team (CIRT)</strong></div>
+    </div>
+  </div>
+</div>
+</body>
+</html>

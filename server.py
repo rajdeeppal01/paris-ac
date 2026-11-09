@@ -1,21 +1,13 @@
 #!/usr/bin/env python3
 """
 =============================================================================
-PARIS-AC (Cyber-Physical Smart-HVAC Canary & Active Deception Engine)
+PARIS-AC (Cyber-Physical Smart-HVAC Canary & Active Deception Engine v2.0)
 =============================================================================
-Inspired by the real-world European retail HVAC cyberattacks where attackers
-infiltrated building management systems (BMS) to artificially spike indoor
-temperatures, causing food spoilage, customer evacuation, and energy waste.
-
-Key Capabilities:
-  1. Virtual Daikin VRV IoT Controller: Realistic BACnet/REST endpoints.
-  2. Thermodynamic Physics Simulator: Accurately simulates compressor strain,
-     airflow RPM, and thermal ramp when setpoints are altered.
-  3. Active Deception Engine: Keeps the attacker engaged by sending believable
-     telemetry confirmations while quietly triggering defense alarms.
-  4. AI Threat Triager: Maps attack to MITRE ATT&CK for ICS (T0836, T0855),
-     calculates risk score, and auto-generates one-click firewall rules.
-  5. Live Security Dashboard: Interactive dark-mode SOC UI at http://localhost:8080
+Dual Protocol Deception Engine:
+  1. Industrial BACnet/IP (UDP 47808): Responds as Daikin Industries, Ltd. (Vendor 77)
+  2. IoT REST API (TCP 8080): Emulated Daikin Intelligent Touch Manager
+  3. Digital Forensics Recorder: Automated Libpcap (.pcap) capture & SHA-256 Chain of Custody
+  4. Real-time SOC Dashboard with live telemetry graph & one-click remediation.
 =============================================================================
 """
 
@@ -31,10 +23,13 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 from datetime import datetime
 
+from forensics import generate_forensic_report, FORENSICS_DIR
+from bacnet_engine import BACnetServer
+
 PORT = 8080
 
 # ---------------------------------------------------------------------------
-# Thermodynamic Simulation State (Daikin Commercial VRV - Paris Châtelet Store)
+# Thermodynamic Simulation State (Daikin Commercial VRV - Paris Flagship)
 # ---------------------------------------------------------------------------
 class HVACPhysicsModel:
     def __init__(self):
@@ -42,7 +37,7 @@ class HVACPhysicsModel:
         self.unit_id = "DAIKIN-VRV-PARIS-04"
         self.location = "Paris Flagship Store - Zone 1 (Retail Floor)"
         self.baseline_temp = 21.5       # °C (normal cooling setpoint)
-        self.current_temp = 21.6        # °C (actual room temp)
+        self.current_temp = 21.5        # °C (actual room temp)
         self.target_setpoint = 21.5     # °C
         self.ambient_outdoor_temp = 31.0 # °C (Summer heatwave in Paris)
         self.compressor_load_pct = 42.0 # % (baseline load)
@@ -51,6 +46,7 @@ class HVACPhysicsModel:
         self.alarm_active = False
         self.mode = "AUTO_COOL"
         self.last_update = time.time()
+        self.history = []  # Time-series telemetry for graphs
 
     def update_physics(self):
         with self.lock:
@@ -58,27 +54,37 @@ class HVACPhysicsModel:
             dt = min(now - self.last_update, 2.0)
             self.last_update = now
 
-            # Room temp slowly drifts towards target setpoint (or ambient if pushed hard)
             diff = self.target_setpoint - self.current_temp
-            ramp_speed = 0.35  # °C per tick towards target
+            ramp_speed = 0.40  # °C per tick
             if abs(diff) > 0.05:
                 self.current_temp += math.copysign(min(abs(diff), ramp_speed * dt), diff)
 
-            # Add subtle natural sensor noise
             noise = (random.random() - 0.5) * 0.08
             self.current_temp = round(self.current_temp + noise, 2)
 
-            # Compressor and power adjust dynamically based on strain
-            if self.target_setpoint > 26.0:  # Malicious heating / shutdown
+            if self.target_setpoint > 26.0:
                 self.mode = "HEAT_OVERRIDE"
-                self.compressor_load_pct = min(98.5, self.compressor_load_pct + (15.0 * dt))
-                self.fan_speed_rpm = min(1450, self.fan_speed_rpm + int(120 * dt))
+                self.compressor_load_pct = min(98.5, self.compressor_load_pct + (18.0 * dt))
+                self.fan_speed_rpm = min(1450, self.fan_speed_rpm + int(140 * dt))
                 self.power_draw_kw = round(self.compressor_load_pct * 0.18, 2)
+                self.alarm_active = True
             else:
                 self.mode = "AUTO_COOL"
-                self.compressor_load_pct = max(38.0, self.compressor_load_pct - (5.0 * dt))
-                self.fan_speed_rpm = max(800, self.fan_speed_rpm - int(40 * dt))
+                self.compressor_load_pct = max(38.0, self.compressor_load_pct - (10.0 * dt))
+                self.fan_speed_rpm = max(800, self.fan_speed_rpm - int(80 * dt))
                 self.power_draw_kw = round(self.compressor_load_pct * 0.11, 2)
+                if self.current_temp < 23.0:
+                    self.alarm_active = False
+
+            # Keep 30 data points for live graphs
+            self.history.append({
+                "time": datetime.now().strftime("%H:%M:%S"),
+                "temp": round(self.current_temp, 1),
+                "power": round(self.power_draw_kw, 2),
+                "load": round(self.compressor_load_pct, 1)
+            })
+            if len(self.history) > 30:
+                self.history.pop(0)
 
     def set_target(self, new_setpoint):
         with self.lock:
@@ -99,43 +105,59 @@ class HVACPhysicsModel:
                 "power_draw_kw": round(self.power_draw_kw, 2),
                 "mode": self.mode,
                 "alarm_active": self.alarm_active,
-                "timestamp": datetime.now().strftime("%H:%M:%S")
+                "timestamp": datetime.now().strftime("%H:%M:%S"),
+                "history": list(self.history)
             }
 
 hvac_model = HVACPhysicsModel()
 
 # ---------------------------------------------------------------------------
-# Security Event Queue & AI Triage Engine
+# Security Event Queue & Incident Response Recorder
 # ---------------------------------------------------------------------------
 security_incidents = []
 incident_lock = threading.Lock()
 
-def analyze_threat_with_ai(incident):
+def record_incident(client_ip, protocol, action_type, requested_setpoint, raw_packet_bytes=None, payload=None):
     """
-    AI Triage Engine: Evaluates the attack vector, calculates severity,
-    maps to MITRE ATT&CK for Industrial Control Systems (ICS),
-    and generates instant defensive firewall commands.
+    Central Incident Processor: updates physics, triggers forensics recording,
+    and publishes alerts to the SOC feed.
     """
-    setpoint = incident.get("requested_setpoint", 0)
-    client_ip = incident.get("client_ip", "unknown")
-    path = incident.get("path", "")
-    payload = incident.get("payload", {})
+    # 1. Update physics
+    hvac_model.set_target(requested_setpoint)
 
-    severity = 9.4 if setpoint >= 32.0 else 7.8
-    mitre_ids = ["T0836: Modify Parameter", "T0855: Unauthorized Command Message", "T0887: Wireless/Network Sniffing"]
+    case_id = f"CASE-PARIS-{int(time.time()*1000) % 100000}"
+    timestamp = datetime.now().strftime("%H:%M:%S")
+
+    # 2. Build Incident Data
+    incident = {
+        "id": case_id,
+        "timestamp": timestamp,
+        "client_ip": client_ip,
+        "protocol": protocol,
+        "action_type": action_type,
+        "requested_setpoint": requested_setpoint,
+        "payload": payload or {"raw_bytes": len(raw_packet_bytes) if raw_packet_bytes else 0},
+        "status": "CAPTURED_AND_DECEIVED"
+    }
+
+    # 3. AI Triage & MITRE Attribution
+    severity = 9.8 if requested_setpoint >= 35.0 else 8.2
+    mitre_ids = [
+        "T0836: Modify Parameter",
+        "T0855: Unauthorized Command Message",
+        "T0887: Wireless/Network Sniffing"
+    ]
 
     summary = (
-        f"Critical Cyber-Physical Temperature Tampering detected from IP {client_ip}. "
-        f"Attacker attempted to force HVAC Zone setpoint to {setpoint}°C (Baseline: 21.5°C). "
-        f"Signature matches the 'Paris Retail AC Overheating Campaign' designed to force physical store evacuations "
-        f"and spoil temperature-sensitive inventory by overriding BMS safety thresholds."
+        f"Critical Cyber-Physical Temperature Tampering detected over {protocol} from {client_ip}. "
+        f"Attacker attempted to force HVAC Zone setpoint to {requested_setpoint}°C (Baseline: 21.5°C). "
+        f"Target: Daikin VRV-IV Chiller Loop. Forensic packet capture sealed with SHA-256 chain-of-custody."
     )
 
     remediation = (
-        f"# Instant Remediation Commands:\n"
-        f"netsh advfirewall firewall add rule name=\"BLOCK_PARIS_AC_ATTACKER_{client_ip}\" dir=in action=block remoteip={client_ip}\n"
-        f"iptables -A INPUT -s {client_ip} -j DROP\n"
-        f"# BMS Security Action: Revoke API Token session, revert VRV setpoint to fail-safe 21.5°C."
+        f"# Incident Response Isolation Commands:\n"
+        f"netsh advfirewall firewall add rule name=\"BLOCK_DAIKIN_{client_ip}\" dir=in action=block remoteip={client_ip}\n"
+        f"iptables -A INPUT -s {client_ip} -j DROP"
     )
 
     incident["ai_analysis"] = {
@@ -146,12 +168,24 @@ def analyze_threat_with_ai(incident):
         "analyzed_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     }
 
+    # 4. Generate Formal Forensic Artifacts (PCAP + HTML Dossier)
+    packets_to_save = [raw_packet_bytes] if raw_packet_bytes else None
+    forensic_res = generate_forensic_report(incident, raw_packets=packets_to_save)
+    incident["forensics"] = forensic_res
+
+    with incident_lock:
+        security_incidents.append(incident)
+
+    print(f"\n[!] ALERT: Security Incident Recorded: {case_id}")
+    print(f"[!] Protocol: {protocol} | Attacker: {client_ip} | Target: {requested_setpoint}°C")
+    print(f"[!] Evidence PCAP: {forensic_res['pcap_basename']} (SHA256: {forensic_res['sha256'][:16]}...)")
+
 # ---------------------------------------------------------------------------
-# HTTP Server (Canary Endpoints + SOC Dashboard)
+# HTTP Server (REST Canary, SOC Dashboard, and Evidence Download)
 # ---------------------------------------------------------------------------
 class CanaryRequestHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
-        # Clean terminal logging
+        # Clean logging
         sys.stderr.write(f"[{datetime.now().strftime('%H:%M:%S')}] {self.address_string()} - {format % args}\n")
 
     def _send_json(self, status_code, data):
@@ -181,7 +215,7 @@ class CanaryRequestHandler(BaseHTTPRequestHandler):
             self.wfile.write(DASHBOARD_HTML.encode("utf-8"))
             return
 
-        # 2. SOC Telemetry Feed (Polling for Dashboard)
+        # 2. SOC Telemetry Feed
         if url.path == "/api/soc/feed":
             telemetry = hvac_model.get_snapshot()
             with incident_lock:
@@ -193,18 +227,54 @@ class CanaryRequestHandler(BaseHTTPRequestHandler):
             })
             return
 
-        # 3. Canary Bait Endpoint: Daikin Controller Info
-        if url.path in ["/api/v1/hvac/status", "/api/v1/system/status", "/bacnet/device-info"]:
+        # 3. Download / View Forensic Dossier HTML
+        if url.path == "/api/forensics/dossier":
+            params = parse_qs(url.query)
+            case_id = params.get("case_id", [""])[0]
+            html_file = os.path.join(FORENSICS_DIR, f"{case_id}_DOSSIER.html")
+            if os.path.exists(html_file):
+                with open(html_file, "rb") as f:
+                    content = f.read()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(content)))
+                self.end_headers()
+                self.wfile.write(content)
+                return
+            self._send_json(404, {"error": "Dossier not found"})
+            return
+
+        # 4. Download Raw Evidence PCAP
+        if url.path == "/api/forensics/pcap":
+            params = parse_qs(url.query)
+            case_id = params.get("case_id", [""])[0]
+            pcap_file = os.path.join(FORENSICS_DIR, f"{case_id}.pcap")
+            if os.path.exists(pcap_file):
+                with open(pcap_file, "rb") as f:
+                    content = f.read()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/vnd.tcpdump.pcap")
+                self.send_header("Content-Disposition", f"attachment; filename=\"{case_id}_EVIDENCE.pcap\"")
+                self.send_header("Content-Length", str(len(content)))
+                self.end_headers()
+                self.wfile.write(content)
+                return
+            self._send_json(404, {"error": "PCAP not found"})
+            return
+
+        # 5. REST Canary Bait Endpoint
+        if url.path in ["/api/v1/hvac/status", "/api/v1/system/status"]:
             self._send_json(200, {
                 "vendor": "Daikin Applied Europe",
                 "model": "VRV IV-S Intelligent Gateway",
                 "firmware_version": "v4.18.2-commercial",
-                "protocol": "BACnet/IP over REST",
+                "bacnet_vendor_id": 77,
+                "protocol": "BACnet/IP over UDP (47808) + REST API (8080)",
                 "telemetry": hvac_model.get_snapshot()
             })
             return
 
-        # 4. Reset Demo State
+        # 6. Reset Demo State
         if url.path == "/api/soc/reset":
             with hvac_model.lock:
                 hvac_model.current_temp = 21.5
@@ -230,38 +300,33 @@ class CanaryRequestHandler(BaseHTTPRequestHandler):
 
         client_ip = self.client_address[0]
 
-        # CANARY TRAP: Temperature Setpoint Override Attempt
-        if url.path in ["/api/v1/hvac/setpoint", "/api/v1/zones/override", "/api/v1/chiller/command"]:
-            new_temp = float(body.get("setpoint_temp", body.get("temp", 0)))
-            auth_token = self.headers.get("Authorization", "Bearer UNKNOWN_OR_EXPLOITED")
+        # One-Click Remediation Execution
+        if url.path == "/api/soc/remediate":
+            with hvac_model.lock:
+                hvac_model.target_setpoint = 21.5
+                hvac_model.mode = "AUTO_COOL"
+            self._send_json(200, {
+                "status": "REMEDIATION_APPLIED",
+                "message": "Fail-safe cooling engaged (21.5°C). Attacker traffic dropped."
+            })
+            return
 
-            # Check if this is an abnormal or malicious tamper (> 26°C or < 16°C)
+        # REST Canary Trap: Temperature Override
+        if url.path in ["/api/v1/hvac/setpoint", "/api/v1/zones/override"]:
+            new_temp = float(body.get("setpoint_temp", body.get("temp", 0)))
             is_malicious = (new_temp >= 26.0 or new_temp <= 16.0 or "override" in str(body).lower())
 
             if is_malicious:
-                # 1. Update physics model to begin thermal climb
-                hvac_model.set_target(new_temp)
+                record_incident(
+                    client_ip=client_ip,
+                    protocol="HTTP/REST (Port 8080)",
+                    action_type="REST_UNAUTHORIZED_SETPOINT_OVERRIDE",
+                    requested_setpoint=new_temp,
+                    raw_packet_bytes=raw_body.encode(),
+                    payload=body
+                )
 
-                # 2. Record security incident
-                incident = {
-                    "id": f"INC-PARIS-{int(time.time()*1000) % 100000}",
-                    "timestamp": datetime.now().strftime("%H:%M:%S"),
-                    "client_ip": client_ip,
-                    "path": url.path,
-                    "requested_setpoint": new_temp,
-                    "payload": body,
-                    "auth_header": auth_token,
-                    "status": "CAPTURED_AND_DECEIVED"
-                }
-
-                # 3. AI Triage
-                analyze_threat_with_ai(incident)
-
-                with incident_lock:
-                    security_incidents.append(incident)
-
-                # 4. ACTIVE DECEPTION: Return realistic success response to the attacker
-                # The attacker thinks they succeeded, keeping them trapped while security responds!
+                # Return realistic deceptive success response
                 self._send_json(200, {
                     "status": "COMMAND_ACCEPTED",
                     "unit": hvac_model.unit_id,
@@ -271,9 +336,7 @@ class CanaryRequestHandler(BaseHTTPRequestHandler):
                     "message": "Actuator coil energized. Target setpoint acknowledged."
                 })
                 return
-
             else:
-                # Normal benign temperature request
                 hvac_model.set_target(new_temp)
                 self._send_json(200, {"status": "SUCCESS", "current_setpoint": new_temp})
                 return
@@ -289,16 +352,17 @@ def physics_loop():
         time.sleep(0.5)
 
 # ---------------------------------------------------------------------------
-# Built-in SOC Dashboard Frontend (Modern, High-Tech, Cyber Dark-Mode)
+# Built-in High-Tech SOC Dashboard Frontend (with Chart.js & Forensics)
 # ---------------------------------------------------------------------------
 DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>PARIS-AC | Cyber-Physical Smart-HVAC Canary</title>
+<title>PARIS-AC v2.0 | Daikin OT Canary & Digital Forensics</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;800&family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 <style>
   :root {
     --bg-dark: #090d16;
@@ -350,6 +414,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     border-color: var(--accent-red);
     animation: pulse 1.5s infinite;
   }
+  .badge.protocol {
+    background: rgba(16, 185, 129, 0.15);
+    color: var(--accent-green);
+    border-color: rgba(16, 185, 129, 0.3);
+  }
   @keyframes pulse {
     0%, 100% { opacity: 1; transform: scale(1); }
     50% { opacity: 0.8; transform: scale(1.04); }
@@ -377,7 +446,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     color: var(--text-muted);
     text-transform: uppercase;
     font-weight: 600;
-    letter-spacing: 0.5px;
   }
   .stat-val {
     font-size: 32px;
@@ -385,14 +453,18 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     font-family: 'JetBrains Mono', monospace;
     margin-top: 8px;
   }
-  .stat-sub {
-    font-size: 12px;
-    color: var(--text-muted);
-    margin-top: 4px;
+  .stat-sub { font-size: 12px; color: var(--text-muted); margin-top: 4px; }
+  .chart-container {
+    background: var(--card-bg);
+    border: 1px solid var(--card-border);
+    border-radius: 12px;
+    padding: 20px;
+    margin-bottom: 24px;
+    height: 220px;
   }
   .main-layout {
     display: grid;
-    grid-template-columns: 1.2fr 1fr;
+    grid-template-columns: 1.3fr 1fr;
     gap: 24px;
   }
   @media(max-width: 900px) { .main-layout { grid-template-columns: 1fr; } }
@@ -446,23 +518,62 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     border-radius: 4px;
     border: 1px solid rgba(239, 68, 68, 0.3);
   }
-  .incident-summary {
-    font-size: 13px;
-    line-height: 1.5;
-    color: #e5e7eb;
-    margin: 8px 0;
+  .incident-summary { font-size: 13px; line-height: 1.5; color: #e5e7eb; margin: 8px 0; }
+  .evidence-bar {
+    display: flex;
+    gap: 10px;
+    margin-top: 12px;
+    align-items: center;
+    flex-wrap: wrap;
   }
-  .code-block {
-    background: #0b111e;
-    border: 1px solid #1f293d;
-    padding: 10px;
-    border-radius: 6px;
+  .btn-dossier {
+    background: #0284c7;
+    color: white;
+    text-decoration: none;
+    font-size: 12px;
+    font-weight: bold;
+    padding: 6px 12px;
+    border-radius: 4px;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .btn-dossier:hover { background: #0369a1; }
+  .btn-pcap {
+    background: #059669;
+    color: white;
+    text-decoration: none;
+    font-size: 12px;
+    font-weight: bold;
+    padding: 6px 12px;
+    border-radius: 4px;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .btn-pcap:hover { background: #047857; }
+  .btn-remediate {
+    background: #dc2626;
+    color: white;
+    border: none;
+    font-size: 12px;
+    font-weight: bold;
+    padding: 6px 12px;
+    border-radius: 4px;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .btn-remediate:hover { background: #b91c1c; }
+  .sha-pill {
     font-family: 'JetBrains Mono', monospace;
-    font-size: 11px;
-    color: #38bdf8;
-    overflow-x: auto;
-    white-space: pre-wrap;
-    margin-top: 10px;
+    font-size: 10px;
+    color: #94a3b8;
+    background: #0b111e;
+    padding: 4px 8px;
+    border-radius: 4px;
+    border: 1px solid #1f293d;
   }
   .btn-reset {
     background: #1f2937;
@@ -475,24 +586,16 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     font-weight: 600;
   }
   .btn-reset:hover { background: #374151; }
-  .deception-callout {
-    background: rgba(14, 165, 233, 0.08);
-    border: 1px dashed rgba(14, 165, 233, 0.3);
-    padding: 12px;
-    border-radius: 8px;
-    font-size: 12px;
-    color: #93c5fd;
-    margin-bottom: 16px;
-  }
 </style>
 </head>
 <body>
 
 <div class="header">
   <div class="title-group">
-    <h1>PARIS-AC</h1>
+    <h1>PARIS-AC <span style="font-size: 14px; font-weight: normal; color: var(--text-muted);">v2.0</span></h1>
     <span class="badge" id="systemStatus">HONEYPOT ACTIVE</span>
-    <span class="badge">DAIKIN VRV-IV DECOY</span>
+    <span class="badge protocol">BACnet/IP (Port 47808)</span>
+    <span class="badge">DAIKIN VENDOR ID: 77</span>
   </div>
   <div>
     <button class="btn-reset" onclick="resetDemo()">Reset State</button>
@@ -519,24 +622,29 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   </div>
 
   <div class="stat-card">
-    <div class="stat-label">Threat Incidents</div>
+    <div class="stat-label">Forensic Cases Sealed</div>
     <div class="stat-val" id="valIncidents" style="color: var(--accent-blue)">0</div>
-    <div class="stat-sub">Zero-Day / Tamper Traps</div>
+    <div class="stat-sub">SHA-256 PCAP Artifacts</div>
   </div>
 </div>
 
+<!-- Telemetry Chart -->
+<div class="chart-container">
+  <canvas id="telemetryChart"></canvas>
+</div>
+
 <div class="main-layout">
-  <!-- Left Panel: Live Incidents & AI Triage -->
+  <!-- Left Panel: Live Incidents & Evidence Dossiers -->
   <div class="panel">
     <div class="panel-title">
-      <span>AI Cyber-Physical Incident Triage</span>
-      <span style="font-size: 11px; color: var(--text-muted);" id="incidentTicker">Monitoring incoming traffic...</span>
+      <span>Digital Forensics & Incident Response (DFIR) Evidence</span>
+      <span style="font-size: 11px; color: var(--text-muted);">Chain of Custody Enabled</span>
     </div>
 
     <div id="incidentsContainer">
       <div style="text-align: center; color: var(--text-muted); padding: 40px 0; font-size: 13px;">
         No active attacks detected.<br>
-        Run <code>python attacker.py</code> to simulate the Paris Store AC exploit.
+        Run <code>python bacnet_attacker.py</code> to launch the industrial BACnet attack.
       </div>
     </div>
   </div>
@@ -544,32 +652,92 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <!-- Right Panel: Physical Unit & Deception Status -->
   <div class="panel">
     <div class="panel-title">
-      <span>Decoy Unit Status</span>
+      <span>Decoy OT Infrastructure</span>
       <span class="badge">Paris Châtelet</span>
     </div>
 
-    <div class="deception-callout">
-      <strong>Active Deception Layer:</strong> When attackers tamper with setpoints, the honeypot accepts the command and returns realistic simulated thermal telemetry. The attacker believes they have control while security isolates them.
+    <div style="background: rgba(14, 165, 233, 0.08); border: 1px dashed rgba(14, 165, 233, 0.3); padding: 12px; border-radius: 8px; font-size: 12px; color: #93c5fd; margin-bottom: 16px;">
+      <strong>OT Deception Layer:</strong> Listens on raw BACnet/IP (UDP 47808). Emulates Daikin Industries, Ltd. (Vendor ID 77). Traps Who-Is and WriteProperty requests, records Libpcap byte streams, and calculates SHA-256 evidence integrity.
     </div>
 
     <div style="font-family: 'JetBrains Mono', monospace; font-size: 12px; color: #9ca3af; line-height: 1.8;">
-      <div><strong>Unit Model:</strong> Daikin VRV IV-S Intelligent Gateway</div>
-      <div><strong>Firmware:</strong> v4.18.2-commercial (Emulated)</div>
-      <div><strong>Protocol:</strong> BACnet/IP (Port 47808) / REST API (:8080)</div>
-      <div><strong>Location:</strong> Paris Flagship Store - Retail Zone 1</div>
-      <div><strong>Outdoor Heatwave Temp:</strong> 31.0°C</div>
+      <div><strong>Controller:</strong> Daikin Intelligent Touch Manager (iTM)</div>
+      <div><strong>BACnet Vendor ID:</strong> 77 (Daikin Industries, Ltd.)</div>
+      <div><strong>Device Instance:</strong> 77004</div>
+      <div><strong>Firmware:</strong> v4.18.2-commercial</div>
+      <div><strong>Active Ports:</strong> UDP 47808 (BACnet), TCP 8080 (REST)</div>
+      <div><strong>Facility:</strong> Paris Flagship Store - Retail Zone 1</div>
     </div>
   </div>
 </div>
 
 <script>
+let chartInstance = null;
+
+function initChart() {
+  const ctx = document.getElementById('telemetryChart').getContext('2d');
+  chartInstance = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: [],
+      datasets: [
+        {
+          label: 'Indoor Temp (°C)',
+          data: [],
+          borderColor: '#ef4444',
+          backgroundColor: 'rgba(239, 68, 68, 0.1)',
+          yAxisID: 'yTemp',
+          tension: 0.3,
+          borderWidth: 2,
+          pointRadius: 2
+        },
+        {
+          label: 'Power Draw (kW)',
+          data: [],
+          borderColor: '#0ea5e9',
+          backgroundColor: 'rgba(14, 165, 233, 0.1)',
+          yAxisID: 'yPower',
+          tension: 0.3,
+          borderWidth: 2,
+          pointRadius: 2
+        }
+      ]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      scales: {
+        x: { grid: { color: '#1f293d' }, ticks: { color: '#9ca3af', font: { family: 'JetBrains Mono' } } },
+        yTemp: {
+          type: 'linear',
+          position: 'left',
+          min: 18,
+          max: 42,
+          grid: { color: '#1f293d' },
+          ticks: { color: '#ef4444', callback: v => v + '°C' }
+        },
+        yPower: {
+          type: 'linear',
+          position: 'right',
+          min: 0,
+          max: 20,
+          grid: { drawOnChartArea: false },
+          ticks: { color: '#0ea5e9', callback: v => v + ' kW' }
+        }
+      },
+      plugins: {
+        legend: { labels: { color: '#f3f4f6', font: { family: 'JetBrains Mono' } } }
+      }
+    }
+  });
+}
+
 async function updateFeed() {
   try {
     const res = await fetch('/api/soc/feed');
     const data = await res.json();
     const t = data.telemetry;
 
-    // Update Stats
     document.getElementById('valTemp').innerText = t.current_temp + '°C';
     document.getElementById('valSetpoint').innerText = 'Target: ' + t.target_setpoint + '°C';
     document.getElementById('valLoad').innerText = t.compressor_load_pct + '%';
@@ -577,7 +745,6 @@ async function updateFeed() {
     document.getElementById('valRpm').innerHTML = t.fan_speed_rpm + ' <span style="font-size: 16px;">RPM</span>';
     document.getElementById('valIncidents').innerText = data.incident_count;
 
-    // Visual Alerts
     const cardTemp = document.getElementById('cardTemp');
     const cardLoad = document.getElementById('cardCompressor');
     const sysStatus = document.getElementById('systemStatus');
@@ -594,6 +761,14 @@ async function updateFeed() {
       sysStatus.innerText = 'HONEYPOT ACTIVE';
     }
 
+    // Update Chart
+    if (chartInstance && t.history) {
+      chartInstance.data.labels = t.history.map(h => h.time);
+      chartInstance.data.datasets[0].data = t.history.map(h => h.temp);
+      chartInstance.data.datasets[1].data = t.history.map(h => h.power);
+      chartInstance.update('none');
+    }
+
     // Render Incidents
     const container = document.getElementById('incidentsContainer');
     if (data.incidents && data.incidents.length > 0) {
@@ -601,6 +776,7 @@ async function updateFeed() {
         <div class="incident-card">
           <div class="incident-header">
             <span style="color: var(--accent-red); font-weight: 700;">${inc.id}</span>
+            <span style="color: var(--accent-green); font-weight: 600;">${inc.protocol}</span>
             <span style="color: var(--text-muted);">${inc.timestamp}</span>
           </div>
           <div style="font-size: 13px; font-weight: 600; margin-bottom: 4px;">
@@ -613,7 +789,21 @@ async function updateFeed() {
           <div class="incident-summary">
             ${inc.ai_analysis ? inc.ai_analysis.summary : 'Analyzing payload...'}
           </div>
-          <div class="code-block">${inc.ai_analysis ? inc.ai_analysis.remediation_cmd : ''}</div>
+
+          <div class="evidence-bar">
+            ${inc.forensics ? `
+              <a class="btn-dossier" href="/api/forensics/dossier?case_id=${inc.id}" target="_blank">
+                📄 View Evidence Dossier
+              </a>
+              <a class="btn-pcap" href="/api/forensics/pcap?case_id=${inc.id}" download>
+                📦 Download .PCAP
+              </a>
+              <span class="sha-pill" title="Evidence Integrity Hash">SHA256: ${inc.forensics.sha256.substring(0, 16)}...</span>
+            ` : ''}
+            <button class="btn-remediate" onclick="remediateThreat()">
+              ⚡ Apply Auto-Remediation
+            </button>
+          </div>
         </div>
       `).join('');
     }
@@ -622,13 +812,21 @@ async function updateFeed() {
   }
 }
 
+async function remediateThreat() {
+  await fetch('/api/soc/remediate', { method: 'POST' });
+  updateFeed();
+}
+
 async function resetDemo() {
   await fetch('/api/soc/reset');
   updateFeed();
 }
 
-setInterval(updateFeed, 1000);
-updateFeed();
+window.onload = () => {
+  initChart();
+  setInterval(updateFeed, 1000);
+  updateFeed();
+};
 </script>
 
 </body>
@@ -639,25 +837,38 @@ updateFeed();
 # Server Startup
 # ---------------------------------------------------------------------------
 def main():
-    # Start thermodynamic background simulation
+    # 1. Thermodynamic simulation background thread
     sim_thread = threading.Thread(target=physics_loop, daemon=True)
     sim_thread.start()
 
+    # 2. BACnet/IP Industrial Honeypot listener (UDP 47808)
+    def on_bacnet_attack(client_ip, protocol, action_type, requested_setpoint, raw_packet_bytes):
+        record_incident(
+            client_ip=client_ip,
+            protocol=protocol,
+            action_type=action_type,
+            requested_setpoint=requested_setpoint,
+            raw_packet_bytes=raw_packet_bytes
+        )
+
+    bacnet_srv = BACnetServer(on_attack_callback=on_bacnet_attack)
+    bacnet_srv.start()
+
+    # 3. HTTP Server (REST Canary + Web SOC Dashboard)
     server = ThreadingHTTPServer(("0.0.0.0", PORT), CanaryRequestHandler)
     print("=" * 70)
-    print(f"[*] PARIS-AC Smart-HVAC Canary & Active Deception Engine ONLINE")
-    print(f"[*] Emulating Daikin VRV-IV Commercial Controller (Paris Retail)")
-    print(f"[*] Web SOC Dashboard running at: http://localhost:{PORT}")
-    print(f"[*] Honeypot REST endpoint:       http://localhost:{PORT}/api/v1/hvac/setpoint")
-    print(f"[*] Press Ctrl+C to terminate.")
+    print(f"[*] PARIS-AC v2.0 Smart-HVAC Canary & DFIR Evidence Engine ONLINE")
+    print(f"[*] BACnet/IP Industrial Listener: UDP 0.0.0.0:47808 (Daikin Vendor 77)")
+    print(f"[*] Web SOC Dashboard:             http://localhost:{PORT}")
+    print(f"[*] Forensic Evidence Sealed at:   {FORENSICS_DIR}")
     print("=" * 70)
 
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\n[*] Shutting down PARIS-AC.")
+        bacnet_srv.stop()
         server.shutdown()
 
 if __name__ == "__main__":
     main()
-
